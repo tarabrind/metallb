@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"maps"
 	"net"
+	"sort"
 	"strings"
 
 	"github.com/go-kit/log"
@@ -123,28 +124,31 @@ func (c *layer2Controller) SetBalancer(l log.Logger, name string, lbIPs []net.IP
 	ifs := c.announcer.GetInterfaces()
 	adsForService := l2AdsForService(pool.L2Advertisements, c.myNode, svc)
 
-	// Use our local nodes map to avoid panic and get correct available nodes.
+	// Sort IPs to ensure deterministic indexing for preferred-nodes
+	sortedIPs := make([]net.IP, len(lbIPs))
+	copy(sortedIPs, lbIPs)
+	sort.Slice(sortedIPs, func(i, j int) bool {
+		return bytes.Compare(sortedIPs[i], sortedIPs[j]) < 0
+	})
+
 	speakerMap := c.speakersForPool(l, name, pool, c.nodes)
 	availableNodes := nodesWithActiveSpeakers(speakerMap)
-	// For Cluster traffic policy, this is enough. 
-	// Note: for 'Local', we'd need endpoints here too, but MetalLB calls 
-	// SetBalancer only after ShouldAnnounce has already validated availability.
 
 	preferredNodes := getPreferredNodes(svc)
 	var myDesiredIPs []net.IP
-	for i, ip := range lbIPs {
+	for i, ip := range sortedIPs {
 		if ipOwner(c.myNode, i, ip, preferredNodes, availableNodes, name) {
 			myDesiredIPs = append(myDesiredIPs, ip)
 		}
 	}
 
-	// Important: 'name' passed from main.go is already "namespace/name"
+	// Internal key for announcer
 	svcNamespacedName := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
 	currentAdvs := c.announcer.GetStatus(svcNamespacedName)
 
 	updateStatus := false
 
-	// 1. Remove IPs that we no longer own (or that were removed from service)
+	// 1. Remove IPs that we no longer own
 	for _, oldAdv := range currentAdvs {
 		oldIP := oldAdv.GetIP()
 		isStillDesired := false
@@ -155,7 +159,7 @@ func (c *layer2Controller) SetBalancer(l log.Logger, name string, lbIPs []net.IP
 			}
 		}
 		if !isStillDesired {
-			level.Info(l).Log("event", "removingStaleIP", "ip", oldIP.String(), "msg", "IP no longer belongs to this node, removing announcement")
+			level.Info(l).Log("event", "removingStaleIP", "ip", oldIP.String(), "service", name, "msg", "IP no longer belongs to this node")
 			c.announcer.RemoveIP(name, oldIP)
 			updateStatus = true
 		}

@@ -558,7 +558,7 @@ func (a *Allocator) AllocateFromPoolMulti(
 	return ips, nil
 }
 
-// AllocateIPFromPoolForAdditionalFamily works specially for the preferDualStack
+// AllocateFromPoolForAdditionalFamily works specially for the preferDualStack
 // ipfamily policy in case there is only 1 assigned ip. It tries to allocate an
 // additional ip from the missing family while retaining the ip already allocated to the svc.
 func (a *Allocator) AllocateFromPoolForAdditionalFamily(

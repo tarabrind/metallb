@@ -36,10 +36,9 @@ func TestIPFamilyForAddresses(t *testing.T) {
 			family: DualStack,
 		},
 		{
-			desc:    "dual stack with same address family",
-			ips:     []string{"1.2.3.4", "5.6.7.8"},
-			family:  Unknown,
-			wantErr: true,
+			desc:   "multiple addresses with same address family",
+			ips:    []string{"1.2.3.4", "5.6.7.8"},
+			family: IPv4,
 		},
 		{
 			desc:    "dual stack with empty address",
@@ -54,10 +53,14 @@ func TestIPFamilyForAddresses(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			desc:    "more than 2 addresses",
-			ips:     []string{"1.1.1.1", "100::1", "2.2.2.2"},
-			family:  Unknown,
-			wantErr: true,
+			desc:   "more than 2 addresses (dual stack)",
+			ips:    []string{"1.1.1.1", "100::1", "2.2.2.2"},
+			family: DualStack,
+		},
+		{
+			desc:   "more than 2 addresses (ipv4 only)",
+			ips:    []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"},
+			family: IPv4,
 		},
 	}
 
@@ -100,10 +103,9 @@ func TestIPFamilyForAddressesIPs(t *testing.T) {
 			family: DualStack,
 		},
 		{
-			desc:    "dual stack with same address family",
-			ips:     []net.IP{net.ParseIP("1.2.3.4"), net.ParseIP("5.6.7.8")},
-			family:  Unknown,
-			wantErr: true,
+			desc:   "multiple addresses with same address family",
+			ips:    []net.IP{net.ParseIP("1.2.3.4"), net.ParseIP("5.6.7.8")},
+			family: IPv4,
 		},
 		{
 			desc:    "dual stack with empty address",
@@ -112,10 +114,9 @@ func TestIPFamilyForAddressesIPs(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			desc:    "more than 2 addresses",
-			ips:     []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("100::1"), net.ParseIP("2.2.2.2")},
-			family:  Unknown,
-			wantErr: true,
+			desc:   "more than 2 addresses",
+			ips:    []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("100::1"), net.ParseIP("2.2.2.2")},
+			family: DualStack,
 		},
 	}
 

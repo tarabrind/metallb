@@ -157,22 +157,25 @@ func (c *controller) convergeBalancer(l log.Logger, key string, svc *v1.Service)
 			lbIPs = []net.IP{}
 		}
 
-		// If the number of assigned IPs doesn't match the multi-ip-count annotation,
+		// If the number of assigned IPs doesn't match the desired multi-ip-count,
 		// clear the assignment to force reallocation.
 		multiIPCount := 1
 		if val := valueForAnnotation(svc.Annotations, AnnotationMultiIPCount, ""); val != "" {
-			if n, err := fmt.Sscanf(val, "%d", &multiIPCount); err == nil && n == 1 {
-				expectedCount := multiIPCount
-				// For RequireDualStack, we expect multiIPCount for EACH family.
-				if familyPolicy == v1.IPFamilyPolicyRequireDualStack {
-					expectedCount = multiIPCount * 2
-				}
-				if len(lbIPs) != 0 && len(lbIPs) != expectedCount && len(desiredLbIPs) == 0 {
-					level.Info(l).Log("event", "clearAssignment", "reason", "multiIPCountMismatch", "msg", "assigned IPs count doesn't match multi-ip-count annotation, clearing")
-					c.clearServiceState(key, svc)
-					lbIPs = []net.IP{}
-				}
+			if n, err := fmt.Sscanf(val, "%d", &multiIPCount); err != nil || n != 1 {
+				multiIPCount = 1 // Fallback to 1 on parse error
 			}
+		}
+
+		expectedCount := multiIPCount
+		// For RequireDualStack, we expect multiIPCount for EACH family.
+		if familyPolicy == v1.IPFamilyPolicyRequireDualStack {
+			expectedCount = multiIPCount * 2
+		}
+
+		if len(lbIPs) != 0 && len(lbIPs) != expectedCount && len(desiredLbIPs) == 0 {
+			level.Info(l).Log("event", "clearAssignment", "reason", "multiIPCountMismatch", "msg", "assigned IPs count doesn't match multi-ip-count annotation, clearing", "current", len(lbIPs), "expected", expectedCount)
+			c.clearServiceState(key, svc)
+			lbIPs = []net.IP{}
 		}
 	}
 

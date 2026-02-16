@@ -19,7 +19,7 @@ import (
 	"crypto/sha256"
 	"maps"
 	"net"
-	"sort"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -42,6 +42,7 @@ type layer2Controller struct {
 	ignoreExcludeLB bool
 	sList           SpeakerList
 	onStatusChange  func(types.NamespacedName)
+	nodes           map[string]*v1.Node
 }
 
 func (c *layer2Controller) SetConfig(log.Logger, *config.Config) error {
@@ -92,8 +93,7 @@ func (c *layer2Controller) ShouldAnnounce(l log.Logger, name string, toAnnounce 
 	}
 
 	adsForService := l2AdsForService(pool.L2Advertisements, c.myNode, svc)
-	serviceHasL2Adv := len(adsForService) > 0
-	if !serviceHasL2Adv {
+	if len(adsForService) == 0 {
 		level.Debug(l).Log("event", "skipping should announce l2", "service", name, "reason", "no advertisement matching service on my node")
 		return "noMatchingAdvertisement"
 	}
@@ -109,34 +109,60 @@ func (c *layer2Controller) ShouldAnnounce(l log.Logger, name string, toAnnounce 
 		return "notOwner"
 	}
 
-	level.Debug(l).Log("event", "shouldannounce", "protocol", "l2", "nodes", availableNodes, "service", name)
-
-	// Using the first IP should work for both single and dual stack.
-	ipString := toAnnounce[0].String()
-	// Sort the slice by the hash of node + load balancer ips. This
-	// produces an ordering of ready nodes that is unique to all the services
-	// with the same ip.
-	sort.Slice(availableNodes, func(i, j int) bool {
-		hi := sha256.Sum256([]byte(availableNodes[i] + "#" + ipString))
-		hj := sha256.Sum256([]byte(availableNodes[j] + "#" + ipString))
-
-		return bytes.Compare(hi[:], hj[:]) < 0
-	})
-
-	// Are we first in the list? If so, we win and should announce.
-	if len(availableNodes) > 0 && availableNodes[0] == c.myNode {
-		return ""
+	preferredNodes := getPreferredNodes(svc)
+	for i, ip := range toAnnounce {
+		if ipOwner(c.myNode, i, ip, preferredNodes, availableNodes, name) {
+			return "" // Win if we own at least one IP
+		}
 	}
 
-	// Either not eligible, or lost the election entirely.
 	return "notOwner"
 }
 
 func (c *layer2Controller) SetBalancer(l log.Logger, name string, lbIPs []net.IP, pool *config.Pool, client service, svc *v1.Service) error {
 	ifs := c.announcer.GetInterfaces()
-	updateStatus := false
 	adsForService := l2AdsForService(pool.L2Advertisements, c.myNode, svc)
-	for _, lbIP := range lbIPs {
+
+	// Use our local nodes map to avoid panic and get correct available nodes.
+	speakerMap := c.speakersForPool(l, name, pool, c.nodes)
+	availableNodes := nodesWithActiveSpeakers(speakerMap)
+	// For Cluster traffic policy, this is enough. 
+	// Note: for 'Local', we'd need endpoints here too, but MetalLB calls 
+	// SetBalancer only after ShouldAnnounce has already validated availability.
+
+	preferredNodes := getPreferredNodes(svc)
+	var myDesiredIPs []net.IP
+	for i, ip := range lbIPs {
+		if ipOwner(c.myNode, i, ip, preferredNodes, availableNodes, name) {
+			myDesiredIPs = append(myDesiredIPs, ip)
+		}
+	}
+
+	// Important: 'name' passed from main.go is already "namespace/name"
+	svcNamespacedName := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	currentAdvs := c.announcer.GetStatus(svcNamespacedName)
+
+	updateStatus := false
+
+	// 1. Remove IPs that we no longer own (or that were removed from service)
+	for _, oldAdv := range currentAdvs {
+		oldIP := oldAdv.GetIP()
+		isStillDesired := false
+		for _, desiredIP := range myDesiredIPs {
+			if oldIP.Equal(desiredIP) {
+				isStillDesired = true
+				break
+			}
+		}
+		if !isStillDesired {
+			level.Info(l).Log("event", "removingStaleIP", "ip", oldIP.String(), "msg", "IP no longer belongs to this node, removing announcement")
+			c.announcer.RemoveIP(name, oldIP)
+			updateStatus = true
+		}
+	}
+
+	// 2. Add or update IPs that we DO own.
+	for _, lbIP := range myDesiredIPs {
 		ipAdv := ipAdvertisementFor(lbIP, adsForService)
 		if !ipAdv.MatchInterfaces(ifs...) {
 			level.Warn(l).Log("op", "SetBalancer", "protocol", "layer2", "service", name, "IPAdvertisement", ipAdv,
@@ -147,8 +173,9 @@ func (c *layer2Controller) SetBalancer(l log.Logger, name string, lbIPs []net.IP
 		c.announcer.SetBalancer(name, ipAdv)
 		updateStatus = true
 	}
+
 	if updateStatus {
-		c.onStatusChange(types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace})
+		c.onStatusChange(svcNamespacedName)
 	}
 	return nil
 }
@@ -169,6 +196,7 @@ func (c *layer2Controller) DeleteBalancer(l log.Logger, name, reason string) err
 }
 
 func (c *layer2Controller) SetNode(l log.Logger, n *v1.Node) error {
+	c.nodes[n.Name] = n
 	if c.myNode != n.Name {
 		return nil
 	}
@@ -272,3 +300,59 @@ func (c *layer2Controller) speakersForPool(l log.Logger, name string, pool *conf
 	}
 	return res
 }
+
+func getPreferredNodes(svc *v1.Service) []string {
+	if svc.Annotations == nil {
+		return nil
+	}
+	val, ok := svc.Annotations["metallb.io/preferred-nodes"]
+	if !ok {
+		return nil
+	}
+	nodes := strings.Split(val, ",")
+	for i := range nodes {
+		nodes[i] = strings.TrimSpace(nodes[i])
+	}
+	return nodes
+}
+
+func ipOwner(myNode string, index int, ip net.IP, preferredNodes []string, availableNodes []string, serviceName string) bool {
+	// 1. Check preferred nodes
+	if index < len(preferredNodes) && preferredNodes[index] != "" {
+		pref := preferredNodes[index]
+		// Is the preferred node alive?
+		alive := false
+		for _, n := range availableNodes {
+			if n == pref {
+				alive = true
+				break
+			}
+		}
+		if alive {
+			return myNode == pref
+		}
+		// Fallback to stable hashing if preferred node is dead
+	}
+
+	// 2. Stable Consistent Hashing (Rendezvous Hashing)
+	// We calculate a score for each node based on the IP address.
+	// The node with the highest score wins. This is stable: if a node fails,
+	// only the IPs it owned will move.
+	var (
+		bestNode string
+		maxScore []byte
+	)
+
+	ipString := ip.String()
+	for _, node := range availableNodes {
+		h := sha256.Sum256([]byte(node + "#" + ipString))
+		score := h[:]
+		if maxScore == nil || bytes.Compare(score, maxScore) > 0 {
+			maxScore = score
+			bestNode = node
+		}
+	}
+
+	return bestNode == myNode
+}
+

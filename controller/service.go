@@ -32,6 +32,8 @@ import (
 const (
 	AnnotationPrefix             = "metallb.io"
 	AnnotationAddressPool        = AnnotationPrefix + "/" + "address-pool"
+	AnnotationMultiIPCount       = AnnotationPrefix + "/" + "multi-ip-count"
+	AnnotationPreferredNodes     = AnnotationPrefix + "/" + "preferred-nodes"
 	AnnotationLoadBalancerIPs    = AnnotationPrefix + "/" + "loadBalancerIPs"
 	AnnotationIPAllocateFromPool = AnnotationPrefix + "/" + "ip-allocated-from-pool"
 	AnnotationAllowSharedIP      = AnnotationPrefix + "/" + "allow-shared-ip"
@@ -154,6 +156,24 @@ func (c *controller) convergeBalancer(l log.Logger, key string, svc *v1.Service)
 			c.clearServiceState(key, svc)
 			lbIPs = []net.IP{}
 		}
+
+		// If the number of assigned IPs doesn't match the multi-ip-count annotation,
+		// clear the assignment to force reallocation.
+		multiIPCount := 1
+		if val := valueForAnnotation(svc.Annotations, AnnotationMultiIPCount, ""); val != "" {
+			if n, err := fmt.Sscanf(val, "%d", &multiIPCount); err == nil && n == 1 {
+				expectedCount := multiIPCount
+				// For RequireDualStack, we expect multiIPCount for EACH family.
+				if familyPolicy == v1.IPFamilyPolicyRequireDualStack {
+					expectedCount = multiIPCount * 2
+				}
+				if len(lbIPs) != 0 && len(lbIPs) != expectedCount && len(desiredLbIPs) == 0 {
+					level.Info(l).Log("event", "clearAssignment", "reason", "multiIPCountMismatch", "msg", "assigned IPs count doesn't match multi-ip-count annotation, clearing")
+					c.clearServiceState(key, svc)
+					lbIPs = []net.IP{}
+				}
+			}
+		}
 	}
 
 	// If svc currently has 1 ip and policy PreferDualStack, try assigning ip from the missing family and same pool
@@ -267,6 +287,13 @@ func (c *controller) allocateIPs(key string, svc *v1.Service) ([]net.IP, error) 
 
 	desiredPool := valueForAnnotation(svc.Annotations, AnnotationAddressPool, DeprecatedAnnotationAddressPool)
 
+	multiIPCount := 1
+	if val := valueForAnnotation(svc.Annotations, AnnotationMultiIPCount, ""); val != "" {
+		if n, err := fmt.Sscanf(val, "%d", &multiIPCount); err != nil || n != 1 {
+			return nil, fmt.Errorf("invalid %s: %q", AnnotationMultiIPCount, val)
+		}
+	}
+
 	// If the user asked for a specific IPs, try that.
 	if len(desiredLbIPs) > 0 {
 		if serviceIPFamily != desiredLbIPFamily {
@@ -287,7 +314,7 @@ func (c *controller) allocateIPs(key string, svc *v1.Service) ([]net.IP, error) 
 
 	// Assign ip from requested address pool.
 	if desiredPool != "" {
-		ips, err := c.ips.AllocateFromPool(key, svc, serviceIPFamily, desiredPool, k8salloc.Ports(svc), SharingKey(svc), k8salloc.BackendKey(svc))
+		ips, err := c.ips.AllocateFromPoolMulti(key, svc, serviceIPFamily, desiredPool, k8salloc.Ports(svc), SharingKey(svc), k8salloc.BackendKey(svc), multiIPCount)
 		if err != nil {
 			return nil, err
 		}
@@ -295,7 +322,7 @@ func (c *controller) allocateIPs(key string, svc *v1.Service) ([]net.IP, error) 
 	}
 
 	// Okay, in that case just bruteforce across all pools.
-	return c.ips.Allocate(key, svc, serviceIPFamily, k8salloc.Ports(svc), SharingKey(svc), k8salloc.BackendKey(svc))
+	return c.ips.AllocateMulti(key, svc, serviceIPFamily, k8salloc.Ports(svc), SharingKey(svc), k8salloc.BackendKey(svc), multiIPCount)
 }
 
 func (c *controller) isServiceAllocated(key string) bool {

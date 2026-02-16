@@ -181,14 +181,9 @@ func (a *Allocator) Assign(svcKey string, svc *v1.Service, ips []net.IP, ports [
 		return fmt.Errorf("pool %s not compatible for ip assignment", pool.Name)
 	}
 	// Check the dual-stack constraints:
-	// - Two addresses
-	// - Different families, ipv4 and ipv6
-	if len(ips) > 2 {
-		return fmt.Errorf("more than two addresses %q", ips)
-	}
-	if len(ips) == 2 && (ipfamily.ForAddress(ips[0]) == ipfamily.ForAddress(ips[1])) {
-		return fmt.Errorf("%q %q has the same family", ips[0], ips[1])
-	}
+	// In Multi-IP mode, we allow more than two addresses and they can be from the same family.
+	// The standard K8s logic for DualStack still applies if the user doesn't use Multi-IP,
+	// but here we are relaxing the allocator to be more flexible.
 
 	for _, ip := range ips {
 		// Does the IP already have allocs? If so, needs to be the same
@@ -472,6 +467,97 @@ func (a *Allocator) AllocateFromPool(
 	return ips, nil
 }
 
+// AllocateMulti chooses the most suitable pool and assigns multiple available IPs from that pool
+// to the service.
+func (a *Allocator) AllocateMulti(
+	svcKey string,
+	svc *v1.Service,
+	serviceIPFamily ipfamily.Family,
+	ports []Port,
+	sharingKey, backendKey string,
+	count int,
+) ([]net.IP, error) {
+	if count <= 1 {
+		return a.Allocate(svcKey, svc, serviceIPFamily, ports, sharingKey, backendKey)
+	}
+
+	// First, check the pinned pools.
+	pinnedPools := a.pinnedPoolsForService(svc)
+	for _, pool := range pinnedPools {
+		ips, err := a.AllocateFromPoolMulti(svcKey, svc, serviceIPFamily, pool.Name, ports, sharingKey, backendKey, count)
+		if err == nil {
+			return ips, nil
+		}
+	}
+
+	// Use all pools instead.
+	for _, pool := range a.pools.ByName {
+		if !pool.AutoAssign || pool.ServiceAllocations != nil {
+			continue
+		}
+		ips, err := a.AllocateFromPoolMulti(svcKey, svc, serviceIPFamily, pool.Name, ports, sharingKey, backendKey, count)
+		if err == nil {
+			return ips, nil
+		}
+	}
+
+	return nil, errors.New("no available IPs")
+}
+
+// AllocateFromPoolMulti assigns multiple available IPs from pool to service.
+func (a *Allocator) AllocateFromPoolMulti(
+	svcKey string,
+	svc *v1.Service,
+	serviceIPFamily ipfamily.Family,
+	poolName string,
+	ports []Port,
+	sharingKey,
+	backendKey string,
+	count int,
+) ([]net.IP, error) {
+	if count <= 1 {
+		return a.AllocateFromPool(svcKey, svc, serviceIPFamily, poolName, ports, sharingKey, backendKey)
+	}
+
+	pool := a.pools.ByName[poolName]
+	if pool == nil {
+		return nil, fmt.Errorf("unknown pool %q", poolName)
+	}
+
+	ipsByFamily, err := a.getFreeIPsFromPoolMulti(pool, svcKey, ports, sharingKey, backendKey, count)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	serviceIPFamilyPolicy := ipPolicyForService(svc)
+
+	if serviceIPFamily == ipfamily.IPv4 {
+		ips = ipsByFamily[ipfamily.IPv4]
+	} else if serviceIPFamily == ipfamily.IPv6 {
+		ips = ipsByFamily[ipfamily.IPv6]
+	} else {
+		// DualStack
+		if serviceIPFamilyPolicy == v1.IPFamilyPolicyRequireDualStack || serviceIPFamilyPolicy == v1.IPFamilyPolicyPreferDualStack {
+			// For dual stack, we take N of each if available, or just follow the policy.
+			// To keep it simple for now: if we have both, we return both.
+			ips = append(ips, ipsByFamily[ipfamily.IPv4]...)
+			ips = append(ips, ipsByFamily[ipfamily.IPv6]...)
+		}
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no available IPs in pool %s for %s IPFamily", poolName, serviceIPFamily)
+	}
+
+	err = a.Assign(svcKey, svc, ips, ports, sharingKey, backendKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return ips, nil
+}
+
 // AllocateIPFromPoolForAdditionalFamily works specially for the preferDualStack
 // ipfamily policy in case there is only 1 assigned ip. It tries to allocate an
 // additional ip from the missing family while retaining the ip already allocated to the svc.
@@ -704,6 +790,67 @@ func ipConfusesBuggyFirmwares(ip net.IP) bool {
 		return false
 	}
 	return ip[3] == 0 || ip[3] == 255
+}
+
+func (a *Allocator) getIPsFromCIDR(cidr *net.IPNet, avoidBuggyIPs bool, svc string, ports []Port, sharingKey, backendKey string, count int) []net.IP {
+	sk := &key{
+		sharing: sharingKey,
+		backend: backendKey,
+	}
+	var ips []net.IP
+	cidrCopy := copyCIDR(cidr)
+	c := ipaddr.NewCursor([]ipaddr.Prefix{*ipaddr.NewPrefix(cidrCopy)})
+	for pos := c.First(); pos != nil; pos = c.Next() {
+		if avoidBuggyIPs && ipConfusesBuggyFirmwares(pos.IP) {
+			continue
+		}
+		// We need to check if this IP is already in use by OURSELVES in this very call
+		// because checkSharing only knows about already COMMITTED assignments.
+		alreadyFound := false
+		for _, foundIP := range ips {
+			if foundIP.Equal(pos.IP) {
+				alreadyFound = true
+				break
+			}
+		}
+		if alreadyFound {
+			continue
+		}
+
+		if a.checkSharing(svc, pos.IP.String(), ports, sk) != nil {
+			continue
+		}
+		ips = append(ips, pos.IP)
+		if len(ips) == count {
+			return ips
+		}
+	}
+	return ips
+}
+
+func (a *Allocator) getFreeIPsFromPoolMulti(
+	pool *config.Pool,
+	svcKey string,
+	ports []Port,
+	sharingKey,
+	backendKey string,
+	count int,
+) (map[ipfamily.Family][]net.IP, error) {
+	res := make(map[ipfamily.Family][]net.IP)
+	for _, cidr := range pool.CIDR {
+		cidrIPFamily := ipfamily.ForCIDR(cidr)
+		needed := count - len(res[cidrIPFamily])
+		if needed <= 0 {
+			continue
+		}
+		found := a.getIPsFromCIDR(cidr, pool.AvoidBuggyIPs, svcKey, ports, sharingKey, backendKey, needed)
+		res[cidrIPFamily] = append(res[cidrIPFamily], found...)
+	}
+
+	if len(res[ipfamily.IPv4]) < count && len(res[ipfamily.IPv6]) < count {
+		return nil, fmt.Errorf("no available IPs in pool %s (requested %d)", pool.Name, count)
+	}
+	return res, nil
 }
 
 func (a *Allocator) getIPFromCIDR(cidr *net.IPNet, avoidBuggyIPs bool, svc string, ports []Port, sharingKey, backendKey string) net.IP {

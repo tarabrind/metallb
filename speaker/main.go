@@ -323,6 +323,7 @@ func newController(cfg controllerConfig) (*controller, error) {
 			sList:           cfg.SList,
 			ignoreExcludeLB: cfg.IgnoreExcludeLB,
 			onStatusChange:  cfg.Layer2StatusChange,
+			nodes:           make(map[string]*v1.Node),
 		}
 		protocols = append(protocols, config.Layer2)
 	}

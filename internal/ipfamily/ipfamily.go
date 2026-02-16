@@ -25,29 +25,32 @@ const (
 
 // ForAddresses returns the address family given list of addresses strings.
 func ForAddresses(ips []string) (Family, error) {
-	switch len(ips) {
-	case 1:
-		ip := net.ParseIP(ips[0])
+	if len(ips) == 0 {
+		return Unknown, fmt.Errorf("IPFamilyForAddresses: no addresses provided")
+	}
+
+	hasIPv4 := false
+	hasIPv6 := false
+
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			return Unknown, fmt.Errorf("IPFamilyForAddresses: Invalid address %q", ips)
+			return Unknown, fmt.Errorf("IPFamilyForAddresses: Invalid address %q", ipStr)
 		}
 		if ip.To4() != nil {
-			return IPv4, nil
+			hasIPv4 = true
+		} else {
+			hasIPv6 = true
 		}
-		return IPv6, nil
-	case 2:
-		ip1 := net.ParseIP(ips[0])
-		ip2 := net.ParseIP(ips[1])
-		if ip1 == nil || ip2 == nil {
-			return Unknown, fmt.Errorf("IPFamilyForAddresses: Invalid address %q", ips)
-		}
-		if (ip1.To4() == nil) == (ip2.To4() == nil) {
-			return Unknown, fmt.Errorf("IPFamilyForAddresses: same address family %q", ips)
-		}
-		return DualStack, nil
-	default:
-		return Unknown, fmt.Errorf("IPFamilyForAddresses: invalid ips length %d %q", len(ips), ips)
 	}
+
+	if hasIPv4 && hasIPv6 {
+		return DualStack, nil
+	}
+	if hasIPv4 {
+		return IPv4, nil
+	}
+	return IPv6, nil
 }
 
 // ForAddressesIPs returns the address family from a given list of addresses IPs.

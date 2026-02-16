@@ -70,3 +70,7 @@ func (i *IPAdvertisement) IsAllInterfaces() bool {
 func (i *IPAdvertisement) GetInterfaces() sets.Set[string] {
 	return i.interfaces
 }
+
+func (i *IPAdvertisement) GetIP() net.IP {
+	return i.ip
+}

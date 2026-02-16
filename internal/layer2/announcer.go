@@ -314,6 +314,46 @@ func (a *Announce) DeleteBalancer(name string) {
 	}
 }
 
+// RemoveIP deletes a specific IP address from the set of addresses we should announce for a service.
+func (a *Announce) RemoveIP(name string, ip net.IP) {
+	a.Lock()
+	defer a.Unlock()
+
+	advs, ok := a.ips[name]
+	if !ok {
+		return
+	}
+
+	newAdvs := []IPAdvertisement{}
+	found := false
+	for _, cur := range advs {
+		if cur.ip.Equal(ip) {
+			found = true
+			a.ipRefcnt[cur.ip.String()]--
+			if a.ipRefcnt[cur.ip.String()] > 0 {
+				// Another service is still using this IP, keep it in other services' lists
+				continue
+			}
+
+			for _, client := range a.ndps {
+				if err := client.Unwatch(cur.ip); err != nil {
+					level.Error(a.logger).Log("op", "unwatchMulticastGroup", "error", err, "ip", cur.ip, "interface", client.intf, "msg", "failed to unwatch NDP multicast group for IP")
+				}
+			}
+			continue
+		}
+		newAdvs = append(newAdvs, cur)
+	}
+
+	if found {
+		if len(newAdvs) == 0 {
+			delete(a.ips, name)
+		} else {
+			a.ips[name] = newAdvs
+		}
+	}
+}
+
 // AnnounceName returns true when we have an announcement under name.
 func (a *Announce) AnnounceName(name string) bool {
 	a.RLock()

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -94,17 +95,22 @@ func (r *Layer2StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, utilerrors.NewAggregate(errs)
 	}
 
-	// We are the (sole) leader for this service.
+	// We are leader for at least one IP of this service.
 	var state *v1beta1.ServiceL2Status
-	for _, item := range serviceL2statuses.Items {
-		if item.Labels[LabelAnnounceNode] == r.NodeName && state == nil {
-			state = &item
-			continue
+	for i := range serviceL2statuses.Items {
+		item := &serviceL2statuses.Items[i]
+		if item.Labels[LabelAnnounceNode] == r.NodeName {
+			if state == nil {
+				state = item
+			} else {
+				// We found a redundant status belonging to our node, delete it.
+				if err := r.Delete(ctx, item); err != nil && !errors.IsNotFound(err) {
+					errs = append(errs, err)
+				}
+			}
 		}
-		// Delete statuses from other nodes / redundant statuses belonging to our node
-		if err := r.Delete(ctx, &item); err != nil && !errors.IsNotFound(err) {
-			errs = append(errs, err)
-		}
+		// In Multi-IP mode, we MUST NOT delete statuses from other nodes.
+		// Each node manages its own status.
 	}
 	if len(errs) > 0 {
 		return ctrl.Result{}, utilerrors.NewAggregate(errs)
@@ -127,6 +133,15 @@ func (r *Layer2StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	var result controllerutil.OperationResult
 	var err error
 	result, err = controllerutil.CreateOrPatch(ctx, r.Client, state, func() error {
+		if state.Annotations == nil {
+			state.Annotations = make(map[string]string)
+		}
+		var ips []string
+		for _, adv := range ipAdvS {
+			ips = append(ips, adv.GetIP().String())
+		}
+		state.Annotations["metallb.io/announced-ips"] = strings.Join(ips, ",")
+
 		state.Labels = map[string]string{
 			LabelAnnounceNode:     r.NodeName,
 			LabelServiceName:      serviceName,
